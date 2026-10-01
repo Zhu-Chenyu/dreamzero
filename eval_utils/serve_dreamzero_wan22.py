@@ -124,12 +124,20 @@ VIDEO_KEY_MAPPING = {
         "observation/exterior_image_1_left": "video.exterior_image_2_left",
         "observation/wrist_image_left": "video.wrist_image_left",
     },
+    # RMBench AgiLex ALOHA: 2 cameras (head + front)
+    "rmbench_aloha": {
+        "observation/head_image": "video.head",
+        "observation/front_image": "video.front",
+    },
 }
 STATE_KEY_MAPPING = {
     "oxe_droid": ("state.joint_position", "state.gripper_position"),
+    # rmbench_aloha: 14-dim state split into 4 sub-keys via modality.json
+    "rmbench_aloha": ("state.left_arm", "state.left_gripper", "state.right_arm", "state.right_gripper"),
 }
 LANGUAGE_KEY_MAPPING = {
     "oxe_droid": "annotation.language.action_text",
+    "rmbench_aloha": "annotation.vlm.move.task_description",
 }
 
 
@@ -170,14 +178,14 @@ class DreamZeroWan225BPolicy(BasePolicy):
         self._current_prompt: str = ""
 
     def _convert_observation(self, obs: dict) -> dict:
-        """Convert roboarena observation format to model Batch format.
+        """Convert observation format to model Batch format.
         Incoming frames are resized to the policy's expected (height, width) so
         eval_transform's VideoToTensor check passes.
         """
         image_key_mapping = VIDEO_KEY_MAPPING[self._embodiment_tag]
-        for roboarena_key, model_key in image_key_mapping.items():
-            if roboarena_key in obs:
-                data = obs[roboarena_key]
+        for client_key, model_key in image_key_mapping.items():
+            if client_key in obs:
+                data = obs[client_key]
                 if isinstance(data, np.ndarray):
                     data = _resize_frames_to_resolution(
                         data, self._image_height, self._image_width
@@ -200,22 +208,35 @@ class DreamZeroWan225BPolicy(BasePolicy):
                 video = np.stack(frames_to_use, axis=0)
                 converted[model_key] = video
 
-        state_joint_key, state_gripper_key = STATE_KEY_MAPPING[self._embodiment_tag]
-        if "observation/joint_position" in obs:
-            joint_pos = np.asarray(obs["observation/joint_position"])
-            if joint_pos.ndim == 1:
-                joint_pos = joint_pos.reshape(1, -1)
-            converted[state_joint_key] = joint_pos.astype(np.float64)
+        if self._embodiment_tag == "rmbench_aloha":
+            # 14-dim joint state: left_arm(0:6), left_gripper(6:7), right_arm(7:13), right_gripper(13:14)
+            joint_state = obs.get("observation/joint_state", np.zeros(14, dtype=np.float32))
+            joint_state = np.asarray(joint_state, dtype=np.float64).reshape(-1)
+            if joint_state.size < 14:
+                padded = np.zeros(14, dtype=np.float64)
+                padded[:joint_state.size] = joint_state
+                joint_state = padded
+            converted["state.left_arm"] = joint_state[0:6].reshape(1, -1)
+            converted["state.left_gripper"] = joint_state[6:7].reshape(1, -1)
+            converted["state.right_arm"] = joint_state[7:13].reshape(1, -1)
+            converted["state.right_gripper"] = joint_state[13:14].reshape(1, -1)
         else:
-            converted[state_joint_key] = np.zeros((1, 7), dtype=np.float64)
+            state_joint_key, state_gripper_key = STATE_KEY_MAPPING[self._embodiment_tag]
+            if "observation/joint_position" in obs:
+                joint_pos = np.asarray(obs["observation/joint_position"])
+                if joint_pos.ndim == 1:
+                    joint_pos = joint_pos.reshape(1, -1)
+                converted[state_joint_key] = joint_pos.astype(np.float64)
+            else:
+                converted[state_joint_key] = np.zeros((1, 7), dtype=np.float64)
 
-        if "observation/gripper_position" in obs:
-            gripper_pos = np.asarray(obs["observation/gripper_position"])
-            if gripper_pos.ndim == 1:
-                gripper_pos = gripper_pos.reshape(1, -1)
-            converted[state_gripper_key] = gripper_pos.astype(np.float64)
-        else:
-            converted[state_gripper_key] = np.zeros((1,1), dtype=np.float64)
+            if "observation/gripper_position" in obs:
+                gripper_pos = np.asarray(obs["observation/gripper_position"])
+                if gripper_pos.ndim == 1:
+                    gripper_pos = gripper_pos.reshape(1, -1)
+                converted[state_gripper_key] = gripper_pos.astype(np.float64)
+            else:
+                converted[state_gripper_key] = np.zeros((1, 1), dtype=np.float64)
 
         text_prompt = obs.get("prompt", "")
         logger.info("Text prompt: %s", text_prompt)
@@ -226,7 +247,12 @@ class DreamZeroWan225BPolicy(BasePolicy):
         return converted
 
     def _convert_action(self, action_dict: dict) -> np.ndarray:
-        """Convert model action dict to (N, 8) array (7 joint + 1 gripper)."""
+        """Convert model action dict to numpy array.
+        rmbench_aloha: (N,14) from left_arm/left_gripper/right_arm/right_gripper.
+        oxe_droid: (N,8) from joint_position + gripper_position.
+        """
+        if self._embodiment_tag == "rmbench_aloha":
+            return self._convert_action_rmbench(action_dict)
         joint_action = None
         gripper_action = None
         for key, value in action_dict.items():
@@ -251,6 +277,22 @@ class DreamZeroWan225BPolicy(BasePolicy):
         else:
             gripper_action = np.zeros((N, 1), dtype=np.float32)
         return np.concatenate([joint_action, gripper_action], axis=-1).astype(np.float32)
+
+    def _convert_action_rmbench(self, action_dict: dict) -> np.ndarray:
+        """Convert rmbench_aloha action dict to (N, 14): left_arm(6)+left_gripper(1)+right_arm(6)+right_gripper(1)."""
+        parts = []
+        for key in ["action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"]:
+            if key in action_dict:
+                val = action_dict[key]
+                if isinstance(val, torch.Tensor):
+                    val = val.cpu().numpy()
+                val = np.asarray(val, dtype=np.float32)
+                if val.ndim == 1:
+                    val = val.reshape(1, -1)
+                parts.append(val)
+        if not parts:
+            return np.zeros((1, 14), dtype=np.float32)
+        return np.concatenate(parts, axis=-1).astype(np.float32)
 
     def infer(self, obs: dict) -> np.ndarray:
         session_id = obs.get("session_id")

@@ -346,3 +346,8 @@ class EmbodimentTag(Enum):
     """
     The Mecka robot with hands.
     """
+
+    RMBENCH_ALOHA = "rmbench_aloha"
+    """
+    The RMBench AgiLex ALOHA dual-arm robot (2 cameras: head + front).
+    """
